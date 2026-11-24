@@ -4,7 +4,8 @@
 //! 48 kHz → 32 kHz → 16 kHz with torchaudio's sinc kernels; 16 kHz log-mel (pre-emphasis, 512-point
 //! STFT of a centred 400-sample window, hop 10 ms, Kaldi mel bank, `(ln + 4.5) / 5`); 32 kHz high
 //! band (512-point STFT, hop 10 ms, 16 log bands over 8 kHz, `(log10 + 6) / 3`). Both STFTs centre
-//! with reflect padding, as `torch.stft` does, over the whole window on every call. Constants come
+//! with reflect padding, as `torch.stft` does, over the whole window on every call (two real frames
+//! per complex FFT, sparse filter rows). Constants come
 //! from `data/tagger_front.bin` (lab/haptics/tagger/export_front.py).
 
 const FRONT: &[u8] = include_bytes!("../data/tagger_front.bin");
@@ -15,6 +16,19 @@ pub const MELS: usize = 128;
 pub const BANDS: usize = 16;
 const HOP16: usize = 160;
 const HOP32: usize = 320;
+
+/// Dot product in eight lanes, so it vectorizes.
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    let mut acc = [0f32; 8];
+    let (ca, cb) = (a.chunks_exact(8), b.chunks_exact(8));
+    let tail: f32 = ca.remainder().iter().zip(cb.remainder()).map(|(x, y)| x * y).sum();
+    for (x, y) in ca.zip(cb) {
+        for l in 0..8 {
+            acc[l] += x[l] * y[l];
+        }
+    }
+    acc.iter().sum::<f32>() + tail
+}
 
 struct Kernel {
     taps: Vec<f32>, // new × len
@@ -45,7 +59,11 @@ impl Kernel {
                     break 'outer;
                 }
                 let k = &self.taps[p * self.len..(p + 1) * self.len];
-                out.push(k.iter().enumerate().map(|(t, w)| w * at(base + t as isize)).sum());
+                out.push(if base >= 0 && base as usize + self.len <= x.len() {
+                    dot(k, &x[base as usize..base as usize + self.len])
+                } else {
+                    k.iter().enumerate().map(|(t, w)| w * at(base + t as isize)).sum()
+                });
             }
         }
     }
@@ -67,11 +85,13 @@ impl Fft {
         }
     }
 
-    fn power(&self, x: &[f32; N_FFT], out: &mut [f32; BINS]) {
+    /// Power spectra of two real frames from one complex transform (`a` real, `b` imaginary).
+    fn power2(&self, a: &[f32; N_FFT], b: &[f32; N_FFT], pa: &mut [f32; BINS], pb: &mut [f32; BINS]) {
         let mut re = [0f32; N_FFT];
         let mut im = [0f32; N_FFT];
         for i in 0..N_FFT {
-            re[i] = x[self.rev[i] as usize];
+            re[i] = a[self.rev[i] as usize];
+            im[i] = b[self.rev[i] as usize];
         }
         let mut size = 2;
         while size <= N_FFT {
@@ -91,8 +111,13 @@ impl Fft {
             }
             size *= 2;
         }
-        for (k, o) in out.iter_mut().enumerate() {
-            *o = re[k] * re[k] + im[k] * im[k];
+        // A[k] = (Z[k] + conj Z[N-k]) / 2, B[k] = (Z[k] - conj Z[N-k]) / 2i.
+        for k in 0..BINS {
+            let j = (N_FFT - k) % N_FFT;
+            let (ar, ai) = (0.5 * (re[k] + re[j]), 0.5 * (im[k] - im[j]));
+            let (br, bi) = (0.5 * (im[k] + im[j]), -0.5 * (re[k] - re[j]));
+            pa[k] = ar * ar + ai * ai;
+            pb[k] = br * br + bi * bi;
         }
     }
 }
@@ -104,6 +129,9 @@ pub struct Front {
     win32: Vec<f32>,
     mel: Vec<f32>, // MELS × BINS
     hi: Vec<f32>,  // BANDS × BINS
+    /// Each row's non-zero bins.
+    mel_span: Vec<(usize, usize)>,
+    hi_span: Vec<(usize, usize)>,
     fft: Fft,
     x32: Vec<f32>,
     x16: Vec<f32>,
@@ -142,7 +170,17 @@ impl Front {
             let (_, d, v) = get(n);
             Kernel { taps: v.clone(), len: d[1], width, orig, new }
         };
+        let span = |m: &[f32]| -> Vec<(usize, usize)> {
+            m.chunks_exact(BINS)
+                .map(|r| {
+                    let a = r.iter().position(|&v| v != 0.0).unwrap_or(0);
+                    (a, r.iter().rposition(|&v| v != 0.0).map_or(a, |b| b + 1))
+                })
+                .collect()
+        };
         Front {
+            mel_span: span(&get("mel").2),
+            hi_span: span(&get("hi").2),
             k48: kernel("k48to32", h[0], h[1], h[2]),
             k32: kernel("k32to16", h[3], h[4], h[5]),
             win16: get("win16").2.clone(),
@@ -155,24 +193,40 @@ impl Front {
         }
     }
 
-    /// Centred, reflect-padded STFT power frames of `x` (as torch.stft, center=True).
+    /// Centred, reflect-padded STFT power frames of `x` (as torch.stft, center=True), two per
+    /// transform.
     fn stft(&self, x: &[f32], hop: usize, win: &[f32], mut each: impl FnMut(usize, &[f32; BINS])) -> usize {
         let pad = N_FFT / 2;
         let frames = 1 + x.len() / hop;
-        let reflect = |i: isize| -> f32 {
-            let n = x.len() as isize;
-            let j = if i < 0 { -i } else if i >= n { 2 * (n - 1) - i } else { i };
-            x[j.clamp(0, n - 1) as usize]
-        };
-        let mut buf = [0f32; N_FFT];
-        let mut p = [0f32; BINS];
-        for f in 0..frames {
+        let n = x.len() as isize;
+        let fill = |f: usize, buf: &mut [f32; N_FFT]| {
             let s = (f * hop) as isize - pad as isize;
-            for (k, b) in buf.iter_mut().enumerate() {
-                *b = reflect(s + k as isize) * win[k];
+            if s >= 0 && s + N_FFT as isize <= n {
+                for ((b, v), w) in buf.iter_mut().zip(&x[s as usize..s as usize + N_FFT]).zip(win) {
+                    *b = v * w;
+                }
+            } else {
+                for (k, b) in buf.iter_mut().enumerate() {
+                    let i = s + k as isize;
+                    let j = if i < 0 { -i } else if i >= n { 2 * (n - 1) - i } else { i };
+                    *b = x[j.clamp(0, n - 1) as usize] * win[k];
+                }
             }
-            self.fft.power(&buf, &mut p);
-            each(f, &p);
+        };
+        let (mut a, mut b) = ([0f32; N_FFT], [0f32; N_FFT]);
+        let (mut pa, mut pb) = ([0f32; BINS], [0f32; BINS]);
+        for f in (0..frames).step_by(2) {
+            fill(f, &mut a);
+            if f + 1 < frames {
+                fill(f + 1, &mut b);
+            } else {
+                b = [0.0; N_FFT];
+            }
+            self.fft.power2(&a, &b, &mut pa, &mut pb);
+            each(f, &pa);
+            if f + 1 < frames {
+                each(f + 1, &pb);
+            }
         }
         frames
     }
@@ -191,18 +245,16 @@ impl Front {
         bands.resize(BANDS * t, 0.0);
         self.stft(&pre, HOP16, &self.win16, |f, p| {
             if f < t {
-                for m in 0..MELS {
-                    let row = &self.mel[m * BINS..(m + 1) * BINS];
-                    let e: f32 = row.iter().zip(p).map(|(w, v)| w * v).sum();
+                for (m, &(a, b)) in self.mel_span.iter().enumerate() {
+                    let e = dot(&self.mel[m * BINS + a..m * BINS + b], &p[a..b]);
                     mel[m * t + f] = (e.max(1e-7).ln() + 4.5) / 5.0;
                 }
             }
         });
         self.stft(x32, HOP32, &self.win32, |f, p| {
             if f < t {
-                for k in 0..BANDS {
-                    let row = &self.hi[k * BINS..(k + 1) * BINS];
-                    let e: f32 = row.iter().zip(p).map(|(w, v)| w * v).sum();
+                for (k, &(a, b)) in self.hi_span.iter().enumerate() {
+                    let e = dot(&self.hi[k * BINS + a..k * BINS + b], &p[a..b]);
                     bands[k * t + f] = ((e + 1e-8).log10() + 6.0) / 3.0;
                 }
             }
@@ -623,5 +675,22 @@ mod tests {
         assert_eq!(t * MELS, get("mel").len());
         assert!(max_err(&mel, get("mel")) < 2e-3, "mel {}", max_err(&mel, get("mel")));
         assert!(max_err(&bands, get("hi")) < 2e-3, "bands {}", max_err(&bands, get("hi")));
+    }
+}
+
+#[cfg(test)]
+mod bench {
+    #[test]
+    #[ignore]
+    fn front_cost() {
+        let mut f = super::Front::new();
+        let x: Vec<f32> = (0..192 * 480).map(|i| ((i as f32) * 0.013).sin() * 0.3).collect();
+        let (mut m, mut b) = (Vec::new(), Vec::new());
+        f.features48(&x, &mut m, &mut b);
+        let t0 = std::time::Instant::now();
+        for _ in 0..50 {
+            f.features48(&x, &mut m, &mut b);
+        }
+        eprintln!("features48 1.92 s: {:.2} ms", t0.elapsed().as_secs_f64() * 1000.0 / 50.0);
     }
 }
