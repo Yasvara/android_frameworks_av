@@ -20,4 +20,5 @@ void hentak_rs_tap_feed(void* tap, int32_t uid, float sensitivity, const void* p
 bool hentak_rs_set_catalog(int32_t uid, const char* path);
 size_t hentak_rs_dump(char* buf, size_t len);
 bool hentak_rs_set_tagger(uint8_t* base, size_t len);
+bool hentak_rs_set_sounds(int32_t uid, const uint8_t* base, size_t len);
 }

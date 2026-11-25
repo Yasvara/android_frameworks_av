@@ -183,3 +183,25 @@ pub unsafe extern "C" fn hentak_rs_set_tagger(base: *mut u8, len: usize) -> bool
         None => false,
     }
 }
+
+/// audioserver: hands over a read-only mapping of the armed game's sound-call ring (framefx/sounds)
+/// for `uid`, or drops it (null). The worker unmaps it once nothing uses it. False if the memory
+/// isn't such a ring (the caller still owns it then).
+///
+/// # Safety
+/// `base` is a read-only mmap of `len` bytes nobody else unmaps.
+#[no_mangle]
+pub unsafe extern "C" fn hentak_rs_set_sounds(uid: i32, base: *const u8, len: usize) -> bool {
+    if base.is_null() {
+        rt::set_sounds(uid, None);
+        return true;
+    }
+    // SAFETY: the caller's contract.
+    match unsafe { crate::sounds::Sounds::adopt(base, len, true) } {
+        Some(s) => {
+            rt::set_sounds(uid, Some(s));
+            true
+        }
+        None => false,
+    }
+}

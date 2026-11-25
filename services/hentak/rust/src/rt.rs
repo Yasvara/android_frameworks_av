@@ -1,6 +1,8 @@
 //! The audioserver side. Mixer threads hand each armed track's audio over as native-rate mono
 //! (one add per channel, a ring push, a futex wake); one worker thread runs the v2 detector on it
 //! and, when the game has a catalog, the onset classifier that keeps voice, music and UI quiet.
+//! When the game's own sound calls come in ([`crate::sounds`]), they settle a hit first: what
+//! the game started just before the onset decides it, and the tagger only what they leave open.
 //! Events leave through the C++ sender's queue.
 
 use crate::catalog::Catalog;
@@ -10,6 +12,7 @@ use crate::model::{embed, CTX_MAX};
 use crate::music::Matcher;
 use crate::onset::{Onset, OnsetCfg};
 use crate::ring::Ring;
+use crate::sounds::{Class, Evidence, Sounds};
 use crate::tagger::{self, shm::Session};
 use crate::tap2::{Kind, Sink, Tap2, Verdict};
 use std::cell::UnsafeCell;
@@ -42,6 +45,21 @@ const WORKER_NICE: i32 = -19;
 
 extern "C" {
     fn setpriority(which: i32, who: u32, prio: i32) -> i32;
+    fn clock_gettime(clock: i32, ts: *mut Timespec) -> i32;
+}
+
+#[repr(C)]
+struct Timespec {
+    sec: i64,
+    nsec: i64,
+}
+
+/// CLOCK_MONOTONIC, the clock of the game's own calls.
+fn mono_ns() -> u64 {
+    let mut ts = Timespec { sec: 0, nsec: 0 };
+    // SAFETY: a valid out pointer; CLOCK_MONOTONIC is 1.
+    unsafe { clock_gettime(1, &mut ts) };
+    ts.sec as u64 * 1_000_000_000 + ts.nsec as u64
 }
 
 /// uid, kind, intensity, sharpness, track, count, levels.
@@ -54,6 +72,12 @@ pub struct Tap {
     rate: AtomicU32,
     /// Bumped when the rate changes: the worker starts the track over.
     epoch: AtomicU32,
+    /// Frames the ring took so far, and when the last of them came (CLOCK_MONOTONIC ns): where a
+    /// popped sample sits on the clock of the game's own calls.
+    fed: AtomicU64,
+    fed_ns: AtomicU64,
+    /// Frames the worker took out of the ring.
+    taken: AtomicU64,
     scratch: UnsafeCell<[f32; BATCH]>,
 }
 
@@ -74,6 +98,11 @@ struct Shared {
     tagger_gen: AtomicU32,
     /// Hits settled by the tagger: kick, swish, stream, quiet, rules, music; and timed out.
     verdicts: [AtomicU64; 7],
+    /// The armed game's own sound calls, and its uid.
+    sounds: Mutex<Option<(i32, Arc<Mutex<Sounds>>)>>,
+    sounds_gen: AtomicU32,
+    /// Hits the game's calls settled: fired, kept quiet; and left to the tagger.
+    game: [AtomicU64; 3],
 }
 
 static SHARED: LazyLock<Shared> = LazyLock::new(|| Shared {
@@ -89,6 +118,9 @@ static SHARED: LazyLock<Shared> = LazyLock::new(|| Shared {
     tagger: Mutex::new(None),
     tagger_gen: AtomicU32::new(0),
     verdicts: Default::default(),
+    sounds: Mutex::new(None),
+    sounds_gen: AtomicU32::new(0),
+    game: Default::default(),
 });
 
 pub fn init(post: PostFn) {
@@ -112,6 +144,9 @@ impl Tap {
             sens: AtomicU32::new(0),
             rate: AtomicU32::new(0),
             epoch: AtomicU32::new(0),
+            fed: AtomicU64::new(0),
+            fed_ns: AtomicU64::new(0),
+            taken: AtomicU64::new(0),
             scratch: UnsafeCell::new([0.0; BATCH]),
         });
         SHARED.taps.lock().unwrap().push(t.clone());
@@ -138,6 +173,7 @@ impl Tap {
         // SAFETY: see the Sync impl.
         let scratch = unsafe { &mut *self.scratch.get() };
         let scale = 1.0 / channels as f32;
+        let mut took = 0;
         match pcm {
             Pcm::I16(s) => {
                 for chunk in s.chunks(BATCH * channels) {
@@ -145,7 +181,7 @@ impl Tap {
                     for (o, f) in scratch.iter_mut().zip(chunk.chunks_exact(channels)) {
                         *o = f.iter().map(|&v| v as i32).sum::<i32>() as f32 * (scale / 32768.0);
                     }
-                    self.ring.push(&scratch[..n]);
+                    took += self.ring.push(&scratch[..n]);
                 }
             }
             Pcm::F32(s) => {
@@ -154,10 +190,12 @@ impl Tap {
                     for (o, f) in scratch.iter_mut().zip(chunk.chunks_exact(channels)) {
                         *o = f.iter().sum::<f32>() * scale;
                     }
-                    self.ring.push(&scratch[..n]);
+                    took += self.ring.push(&scratch[..n]);
                 }
             }
         }
+        self.fed_ns.store(mono_ns(), Ordering::Relaxed);
+        self.fed.fetch_add(took as u64, Ordering::Release);
         if let Some(w) = SHARED.worker.get() {
             w.unpark();
         }
@@ -168,6 +206,12 @@ impl Tap {
 pub fn set_tagger(session: Option<Session>) {
     *SHARED.tagger.lock().unwrap() = session.map(Arc::new);
     SHARED.tagger_gen.fetch_add(1, Ordering::Release);
+}
+
+/// The armed game's sound calls (framefx/sounds), or None when it has none.
+pub fn set_sounds(uid: i32, sounds: Option<Sounds>) {
+    *SHARED.sounds.lock().unwrap() = sounds.map(|s| (uid, Arc::new(Mutex::new(s))));
+    SHARED.sounds_gen.fetch_add(1, Ordering::Release);
 }
 
 pub fn set_catalog(uid: i32, catalog: Option<Catalog>) {
@@ -187,15 +231,24 @@ pub fn dump() -> String {
         .collect();
     uids.sort();
     let v: Vec<u64> = SHARED.verdicts.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    let g: Vec<u64> = SHARED.game.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    let game = match &*SHARED.sounds.lock().unwrap() {
+        Some((uid, s)) => {
+            let s = s.lock().unwrap();
+            format!("{uid} posts={} named={}", s.read, s.named)
+        }
+        None => "off".into(),
+    };
     format!(
-        "v3 catalogs [{}] fired={} quieted={} music={} playing: {} | tagger {} kick={} swish={} stream={} quiet={} rules={} music={} late={}",
+        "v3 catalogs [{}] fired={} quieted={} music={} playing: {} | tagger {} kick={} swish={} stream={} quiet={} rules={} music={} late={} | game {} fired={} quiet={} open={}",
         uids.join(" "),
         SHARED.fired.load(Ordering::Relaxed),
         SHARED.quieted.load(Ordering::Relaxed),
         SHARED.music.load(Ordering::Relaxed),
         SHARED.music_status.lock().unwrap(),
         if SHARED.tagger.lock().unwrap().is_some() { "on" } else { "off" },
-        v[0], v[1], v[2], v[3], v[4], v[5], v[6]
+        v[0], v[1], v[2], v[3], v[4], v[5], v[6],
+        game, g[0], g[1], g[2]
     )
 }
 
@@ -347,13 +400,80 @@ pub struct Detector {
     /// The tagger session this track feeds (48 kHz only), and the onset it was last asked about.
     tagger: Option<Arc<Session>>,
     asked: Option<u64>,
+    /// The game's own sound calls, and where the end of the audio handed to `process` sits on
+    /// their clock (CLOCK_MONOTONIC ns).
+    sounds: Option<Arc<Mutex<Sounds>>>,
+    anchor_ns: u64,
+    /// The onset the game's calls were last asked about.
+    judged: Option<u64>,
     /// When set, every decided hit: onset ms and verdict (0 fired, 1 quiet, 2 music).
     pub trace: Option<Vec<(u64, usize)>>,
 }
 
+/// How a hit the game's calls name plays.
+fn verdict_for(class: Class) -> Verdict {
+    match class {
+        Class::Gun | Class::Explosion | Class::Impact => Verdict::Hit,
+        Class::Swing => Verdict::Swing,
+        Class::Fire => Verdict::Stream,
+        _ => Verdict::Rules,
+    }
+}
+
 impl Detector {
     pub fn new(rate: u32) -> Self {
-        Self { rate, tap: Tap2::new(), classifier: None, tagger: None, asked: None, trace: None }
+        Self { rate, tap: Tap2::new(), classifier: None, tagger: None, asked: None, sounds: None, anchor_ns: 0, judged: None, trace: None }
+    }
+
+    /// The game's own sound calls, which settle hits before anything else.
+    pub fn set_sounds(&mut self, sounds: Option<Arc<Mutex<Sounds>>>) {
+        self.sounds = sounds;
+    }
+
+    /// Where the last sample of the next `process` call sits on CLOCK_MONOTONIC.
+    pub fn set_anchor(&mut self, ns: u64) {
+        self.anchor_ns = ns;
+    }
+
+    /// Whether the game is posting its sound calls now.
+    fn game_live(&self) -> bool {
+        self.anchor_ns != 0 && self.sounds.as_ref().is_some_and(|s| s.lock().unwrap().live(self.anchor_ns))
+    }
+
+    /// What the game's calls say about a hit with this onset, `end_ms` being the detector's clock
+    /// at the anchor: (quiet code, verdict), or None to leave it to the tagger and the rules.
+    fn by_game(&mut self, onset_ms: u64, end_ms: u64) -> Option<(usize, Verdict)> {
+        if self.judged == Some(onset_ms) {
+            return None;
+        }
+        self.judged = Some(onset_ms);
+        let sounds = self.sounds.as_ref()?;
+        let onset = self.anchor_ns.checked_sub(end_ms.saturating_sub(onset_ms) * 1_000_000)?;
+        let settled = match sounds.lock().unwrap().evidence(onset) {
+            Evidence::Started(c) => Some((0, verdict_for(c))),
+            Evidence::Quiet => Some((1, Verdict::Quiet)),
+            Evidence::Unknown => None,
+        };
+        SHARED.game[match settled {
+            Some((0, _)) => 0,
+            Some(_) => 1,
+            None => 2,
+        }]
+        .fetch_add(1, Ordering::Relaxed);
+        settled
+    }
+
+    /// Settles the waiting hit: quiet (1, 2) or as `verdict`.
+    fn settle(&mut self, onset_ms: u64, quiet: usize, verdict: Verdict, gain: f32, n: &mut [u64; 3], out: &mut impl Sink) {
+        n[quiet] += 1;
+        if let Some(t) = self.trace.as_mut() {
+            t.push((onset_ms, quiet));
+        }
+        if quiet > 0 {
+            self.tap.resolve(false, out);
+        } else {
+            self.tap.resolve_as(verdict, gain, out);
+        }
     }
 
     /// Feeds this track's audio to the tagger and lets its verdicts settle hits; only at the
@@ -383,35 +503,50 @@ impl Detector {
         if self.tagger.is_some() {
             return self.process_tagged(x, sens, out);
         }
+        let game = self.game_live();
+        let end_ms = self.tap.now_ms() + x.len() as u64 * 1000 / self.rate.max(1) as u64;
         let mut n = [0u64; 3];
-        let Some(cls) = self.classifier.as_mut() else {
+        if self.classifier.is_none() && !game {
             self.tap.defer = false;
             self.tap.bed = false;
             self.tap.resolve(true, out);
             self.tap.feed(sens, x, self.rate, out);
             return n;
-        };
+        }
         self.tap.defer = true;
         for chunk in x.chunks((self.rate / 200).max(1) as usize) {
-            self.tap.bed = cls.music(self.tap.now_ms().saturating_sub(VERDICT_MS));
-            self.tap.feed(sens, chunk, self.rate, out);
-            cls.push(chunk);
-            if let Some(p) = self.tap.pending() {
-                if cls.decided_until() >= p.onset_ms + VERDICT_MS {
-                    let verdict = if cls.quiet(p.onset_ms) {
+            match self.classifier.as_mut() {
+                Some(cls) => {
+                    self.tap.bed = cls.music(self.tap.now_ms().saturating_sub(VERDICT_MS));
+                    self.tap.feed(sens, chunk, self.rate, out);
+                    cls.push(chunk);
+                }
+                None => {
+                    self.tap.bed = false;
+                    self.tap.feed(sens, chunk, self.rate, out);
+                }
+            }
+            let Some(p) = self.tap.pending() else { continue };
+            if game {
+                if let Some((quiet, verdict)) = self.by_game(p.onset_ms, end_ms) {
+                    self.settle(p.onset_ms, quiet, verdict, 1.0, &mut n, out);
+                    continue;
+                }
+            }
+            let quiet = match self.classifier.as_ref() {
+                Some(cls) if cls.decided_until() >= p.onset_ms + VERDICT_MS => {
+                    if cls.quiet(p.onset_ms) {
                         1
                     } else if cls.music(p.onset_ms) {
                         2
                     } else {
                         0
-                    };
-                    n[verdict] += 1;
-                    if let Some(t) = self.trace.as_mut() {
-                        t.push((p.onset_ms, verdict));
                     }
-                    self.tap.resolve(verdict == 0, out);
                 }
-            }
+                Some(_) => continue,
+                None => 0,
+            };
+            self.settle(p.onset_ms, quiet, Verdict::Rules, 1.0, &mut n, out);
         }
         n
     }
@@ -422,13 +557,17 @@ impl Detector {
     fn process_tagged(&mut self, x: &[f32], sens: f32, out: &mut impl Sink) -> [u64; 3] {
         let session = self.tagger.clone().unwrap();
         let per_ms = (self.rate / 1000) as u64;
+        let game = self.game_live();
+        let end_ms = self.tap.now_ms() + x.len() as u64 * 1000 / self.rate.max(1) as u64;
         let mut n = [0u64; 3];
         for chunk in x.chunks((self.rate / 200).max(1) as usize) {
             session.write(chunk);
             let latest = session.result();
             let end = session.written();
             let fresh = latest.filter(|v| v.end + TAGGER_FRESH_MS * per_ms >= end);
-            self.tap.defer = !fresh.is_some_and(|v| tagger::burst(&v));
+            let burst = fresh.is_some_and(|v| tagger::burst(&v));
+            // The game's calls see every hit, a burst's too.
+            self.tap.defer = game || !burst;
             let heard = fresh.is_some_and(|v| tagger::bed(&v));
             if let Some(cls) = self.classifier.as_mut() {
                 self.tap.bed = heard || cls.music(self.tap.now_ms().saturating_sub(VERDICT_MS));
@@ -439,6 +578,16 @@ impl Detector {
                 self.tap.feed(sens, chunk, self.rate, out);
             }
             let Some(p) = self.tap.pending() else { continue };
+            if game {
+                if let Some((quiet, verdict)) = self.by_game(p.onset_ms, end_ms) {
+                    self.settle(p.onset_ms, quiet, verdict, 1.0, &mut n, out);
+                    continue;
+                }
+                if burst {
+                    self.settle(p.onset_ms, 0, Verdict::Hit, 1.0, &mut n, out);
+                    continue;
+                }
+            }
             let now = self.tap.now_ms();
             let want = end - now.saturating_sub(p.onset_ms + VERDICT_MS).min(end / per_ms) * per_ms;
             if self.asked != Some(p.onset_ms) && now >= p.onset_ms + VERDICT_MS {
@@ -467,15 +616,7 @@ impl Detector {
                 Verdict::Quiet => 1,
                 _ => 0,
             };
-            n[quiet] += 1;
-            if let Some(t) = self.trace.as_mut() {
-                t.push((p.onset_ms, quiet));
-            }
-            if quiet > 0 {
-                self.tap.resolve(false, out);
-            } else {
-                self.tap.resolve_as(verdict, gain, out);
-            }
+            self.settle(p.onset_ms, quiet, verdict, gain, &mut n, out);
         }
         n
     }
@@ -485,6 +626,7 @@ struct Track {
     epoch: u32,
     catalog_gen: u32,
     tagger_gen: u32,
+    sounds_gen: u32,
     det: Detector,
 }
 
@@ -504,6 +646,11 @@ fn worker() {
         }
         let gen = SHARED.catalog_gen.load(Ordering::Acquire);
         let tgen = SHARED.tagger_gen.load(Ordering::Acquire);
+        let sgen = SHARED.sounds_gen.load(Ordering::Acquire);
+        let sounds = SHARED.sounds.lock().unwrap().clone();
+        if let Some((_, s)) = &sounds {
+            s.lock().unwrap().poll();
+        }
         for tap in &taps {
             let id = Arc::as_ptr(tap) as usize;
             let epoch = tap.epoch.load(Ordering::Acquire);
@@ -514,10 +661,17 @@ fn worker() {
                 epoch: epoch.wrapping_sub(1),
                 catalog_gen: gen,
                 tagger_gen: tgen.wrapping_sub(1),
+                sounds_gen: sgen.wrapping_sub(1),
                 det: Detector::new(rate),
             });
             if tr.epoch != epoch {
-                *tr = Track { epoch, catalog_gen: gen.wrapping_sub(1), tagger_gen: tgen.wrapping_sub(1), det: Detector::new(rate) };
+                *tr = Track {
+                    epoch,
+                    catalog_gen: gen.wrapping_sub(1),
+                    tagger_gen: tgen.wrapping_sub(1),
+                    sounds_gen: sgen.wrapping_sub(1),
+                    det: Detector::new(rate),
+                };
                 if source == Some(id) {
                     source = None;
                 }
@@ -525,6 +679,10 @@ fn worker() {
             if tr.catalog_gen != gen {
                 tr.catalog_gen = gen;
                 tr.det.set_catalog(SHARED.catalogs.lock().unwrap().get(&uid).cloned());
+            }
+            if tr.sounds_gen != sgen {
+                tr.sounds_gen = sgen;
+                tr.det.set_sounds(sounds.as_ref().filter(|(u, _)| *u == uid).map(|(_, s)| s.clone()));
             }
             if tr.tagger_gen != tgen {
                 tr.tagger_gen = tgen;
@@ -539,6 +697,12 @@ fn worker() {
                     break;
                 }
                 had = true;
+                // The last sample popped sits as far before the newest one fed as the backlog.
+                let taken = tap.taken.fetch_add(n as u64, Ordering::Relaxed) + n as u64;
+                let fed = tap.fed.load(Ordering::Acquire);
+                let fed_ns = tap.fed_ns.load(Ordering::Relaxed);
+                let behind = fed.saturating_sub(taken) * 1_000_000_000 / rate.max(1) as u64;
+                tr.det.set_anchor(fed_ns.saturating_sub(behind));
                 let [fired, quieted, music] = tr.det.process(&buf[..n], sens, &mut out);
                 SHARED.fired.fetch_add(fired, Ordering::Relaxed);
                 SHARED.quieted.fetch_add(quieted, Ordering::Relaxed);
@@ -553,5 +717,73 @@ fn worker() {
                 *SHARED.music_status.lock().unwrap() = status;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const RATE: u32 = 48_000;
+    const S: u64 = 1_000_000_000;
+
+    #[derive(Default)]
+    struct Rec(usize);
+
+    impl Sink for Rec {
+        fn event(&mut self, _: Kind, _: f32, _: f32) {
+            self.0 += 1;
+        }
+        fn levels(&mut self, _: &[f32]) {}
+    }
+
+    /// Shots, each a crack and a thump out of silence, at these seconds.
+    fn shots(secs: f32, at: &[f32]) -> Vec<f32> {
+        let mut x = vec![0f32; (secs * RATE as f32) as usize];
+        let mut r = 7u64;
+        for &a in at {
+            let start = (a * RATE as f32) as usize;
+            for k in 0..RATE as usize / 10 {
+                r = r.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let noise = (r >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0;
+                let t = k as f32 / RATE as f32;
+                x[start + k] += 0.5 * noise * (-t / 0.004).exp() + 0.4 * (2.0 * std::f32::consts::PI * 70.0 * t).sin() * (-t / 0.03).exp();
+            }
+        }
+        x
+    }
+
+    #[test]
+    fn the_games_calls_settle_hits() {
+        // The audio's first sample is at 100 s on the calls' clock.
+        let t0 = 100 * S;
+        let ms = |s: f32| t0 + (s * 1000.0) as u64 * 1_000_000;
+        let posts = [
+            (ms(0.0), "Ev_bgm_battle"),
+            (ms(0.42), "Play_Gun_Fire"),        // shot at 0.5: fires
+            (ms(1.42), "Ev_sfx_ui_click"),      // shot at 1.5: quiet
+            (ms(2.42), "Play_Gun_Fire"),        // shot at 2.5: fires
+                                                // shot at 3.5: within the gun's hold, the rules
+                                                // shot at 5.5: nothing new, nothing playing: quiet
+        ];
+        let x = shots(6.0, &[0.5, 1.5, 2.5, 3.5, 5.5]);
+        let mut d = Detector::new(RATE);
+        d.set_sounds(Some(Arc::new(Mutex::new(Sounds::from_posts(&posts)))));
+        d.trace = Some(Vec::new());
+        let mut rec = Rec::default();
+        for (k, c) in x.chunks(RATE as usize / 50).enumerate() {
+            d.set_anchor(t0 + ((k + 1) * c.len()) as u64 * S / RATE as u64);
+            d.process(c, 1.0, &mut rec);
+        }
+        let trace = d.trace.unwrap();
+        // By shot: a quiet crack lets its thump through as an onset of its own, quiet too.
+        let by_shot = |q: bool| {
+            let mut v: Vec<u64> = trace.iter().filter(|t| (t.1 > 0) == q).map(|t| t.0 / 100).collect();
+            v.dedup();
+            v
+        };
+        let (fired, quiet) = (by_shot(false), by_shot(true));
+        assert_eq!(fired, [5, 25, 35], "trace {trace:?}");
+        assert_eq!(quiet, [15, 55], "trace {trace:?}");
     }
 }

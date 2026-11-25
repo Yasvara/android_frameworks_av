@@ -27,6 +27,7 @@ pub mod ring;
 pub mod rt;
 #[cfg(feature = "scan")]
 pub mod scan;
+pub mod sounds;
 pub mod tagger;
 pub mod tap2;
 pub mod verify;

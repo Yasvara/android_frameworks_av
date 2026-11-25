@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -24,6 +25,7 @@
 #include <binder/IBinder.h>
 #include <binder/IServiceManager.h>
 #include <binder/Parcel.h>
+#include <cutils/ashmem.h>
 #include <log/log.h>
 #include <poll.h>
 #include <pthread.h>
@@ -54,6 +56,10 @@ std::atomic<float> gGain{1.f};
 constexpr char16_t kService[] = u"yasvara_hentak";
 constexpr char16_t kDescriptor[] = u"org.yasvara.hentak.IHentak";
 constexpr uint32_t kTransactionPulse = IBinder::FIRST_CALL_TRANSACTION;
+// uid -> i32 pid of the game process whose sound-call ring follows (framefx/sounds), 0 for none,
+// then the ring's descriptor.
+constexpr uint32_t kTransactionSounds = IBinder::FIRST_CALL_TRANSACTION + 1;
+constexpr auto kSoundsLookup = std::chrono::seconds(2);
 constexpr char kFollower[] = "android.hardware.vibrator.IVibrator/hentak";
 // the learned tagger in the same HAL, and its session memory (hentak::tagger::shm).
 constexpr char kTagger[] = "vendor.yasvara.hentak.ITagger/default";
@@ -289,6 +295,60 @@ void senderLoop() {
     }
 }
 
+int64_t armedUid() {
+    for (const Slot& s : gSlots) {
+        const int64_t uid = s.uid.load(std::memory_order_relaxed);
+        if (uid != kFree) return uid;
+    }
+    return kFree;
+}
+
+// Follows the armed game's own sound calls: asks system_server for the ring of its newest process
+// (framefx/sounds's shared memory, passed on by the framefx broker) and hands a read-only mapping to the
+// Rust worker, which settles hits by it.
+void soundsLoop() {
+    sp<IBinder> service;
+    int64_t uid = kFree;
+    int32_t pid = 0;
+    for (;;) {
+        std::this_thread::sleep_for(kSoundsLookup);
+        const int64_t armed = armedUid();
+        int32_t newest = 0;
+        Parcel reply;
+        if (armed != kFree) {
+            if (service == nullptr || !service->isBinderAlive()) {
+                service = defaultServiceManager()->checkService(String16(kService));
+            }
+            Parcel data;
+            data.writeInterfaceToken(String16(kDescriptor));
+            data.writeInt32(static_cast<int32_t>(armed));
+            if (service != nullptr && service->transact(kTransactionSounds, data, &reply) == OK) {
+                newest = reply.readInt32();
+            }
+        }
+        if (armed == uid && newest == pid) continue;
+        if (uid != kFree && pid != 0) hentak_rs_set_sounds(static_cast<int32_t>(uid), nullptr, 0);
+        uid = armed;
+        pid = 0;
+        if (newest <= 0) continue;
+        // The game's own region. ashmem keeps its size once mapped and libcutils only takes a
+        // memfd sealed at its size, so the game can't make us fault past its end.
+        const int fd = reply.readFileDescriptor();
+        if (fd < 0 || !ashmem_valid(fd)) continue;
+        const int regionSize = ashmem_get_size_region(fd);
+        if (regionSize <= 0) continue;
+        const size_t size = static_cast<size_t>(regionSize);
+        void* base = mmap(nullptr, size, PROT_READ, MAP_SHARED, fd, 0);
+        if (base == MAP_FAILED) continue;
+        if (!hentak_rs_set_sounds(static_cast<int32_t>(uid), static_cast<const uint8_t*>(base), size)) {
+            munmap(base, size);
+            continue;
+        }
+        pid = newest;
+        ALOGI("sound calls of uid %lld, pid %d", static_cast<long long>(uid), pid);
+    }
+}
+
 // The Rust worker's events, into the same queue.
 void postFromRust(int32_t uid, int32_t kind, float intensity, float sharpness, uintptr_t track,
                   int32_t count, const float* levels) {
@@ -311,6 +371,10 @@ void startSender() {
             pthread_setname_np(pthread_self(), "hentak_sender");
             setpriority(PRIO_PROCESS, 0, kSenderNice);
             senderLoop();
+        }).detach();
+        std::thread([] {
+            pthread_setname_np(pthread_self(), "hentak_sounds");
+            soundsLoop();
         }).detach();
     });
 }
@@ -433,7 +497,7 @@ std::string dump() {
     snprintf(buf, sizeof(buf), " gain=%.2f %s posted=%u sent=%u levels=%u dropped=%u starved=%u ",
              gGain.load(), gFollowing.load() ? "follower" : "events", gPosted.load(), gSent.load(),
              gLevelsSent.load(), gDropped.load(), gStarved.load());
-    char rs[256];
+    char rs[512];
     hentak_rs_dump(rs, sizeof(rs));
     return out + buf + rs;
 }
