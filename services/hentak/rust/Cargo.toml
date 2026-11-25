@@ -1,0 +1,20 @@
+# Host builds and `cargo test` only; the platform builds this crate with Soong (Android.bp).
+[package]
+name = "hentak"
+version = "0.3.0"
+edition = "2021"
+publish = false
+
+[features]
+default = ["scan"]
+# The catalog scanner (Wwise containers, Vorbis decoder, training); audioserver builds without it.
+scan = []
+
+[lib]
+path = "src/lib.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"

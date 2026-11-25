@@ -1,0 +1,19 @@
+// SPDX-FileCopyrightText: The Yasvara Project
+// SPDX-License-Identifier: Apache-2.0
+
+package {
+    default_applicable_licenses: ["frameworks_av_license"],
+}
+
+// Per-uid audio rules of Swara, shared by AudioFlinger and AudioPolicyService
+// inside audioserver.
+cc_library_static {
+    name: "libswarastate",
+    srcs: ["SwaraState.cpp"],
+    export_include_dirs: ["include"],
+    shared_libs: ["liblog"],
+    cflags: [
+        "-Wall",
+        "-Werror",
+    ],
+}

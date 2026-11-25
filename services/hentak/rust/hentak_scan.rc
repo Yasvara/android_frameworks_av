@@ -1,0 +1,14 @@
+# Hentak catalog scan of one game's sound files, started when system_server names the game.
+on post-fs-data
+    mkdir /data/misc/hentak 2750 system audio
+
+service hentak_scan /system_ext/bin/hentak_scan
+    class late_start
+    user system
+    group system audio media_rw ext_data_rw ext_obb_rw
+    disabled
+    oneshot
+    priority 10
+
+on property:sys.yasvara.hentak.scan=*
+    start hentak_scan

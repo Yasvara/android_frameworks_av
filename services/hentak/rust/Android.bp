@@ -1,0 +1,65 @@
+// SPDX-FileCopyrightText: The Yasvara Project
+// SPDX-License-Identifier: Apache-2.0
+
+package {
+    default_applicable_licenses: ["frameworks_av_license"],
+}
+
+// Hentak's detectors, for audioserver (C ABI in src/ffi.rs).
+rust_ffi_static {
+    name: "libhentak_rs",
+    crate_name: "hentak",
+    crate_root: "src/lib.rs",
+    srcs: [
+        "src/**/*.rs",
+        "data/tagger_front.bin",
+    ],
+    vendor_available: true,
+    edition: "2021",
+    lints: "vendor",
+    clippy_lints: "vendor",
+    apex_available: ["//apex_available:platform"],
+}
+
+// The catalog scanner: Wwise containers, Vorbis decoder, training.
+rust_library_rlib {
+    name: "libhentak_scan",
+    crate_name: "hentak",
+    crate_root: "src/lib.rs",
+    srcs: [
+        "src/**/*.rs",
+        "data/*.bin",
+    ],
+    edition: "2021",
+    lints: "vendor",
+    clippy_lints: "vendor",
+    features: ["scan"],
+}
+
+rust_binary {
+    name: "hentak_scan",
+    crate_name: "hentak_scan",
+    srcs: ["src/bin/hentak_scan.rs"],
+    edition: "2021",
+    lints: "vendor",
+    clippy_lints: "vendor",
+    rustlibs: ["libhentak_scan"],
+    shared_libs: ["liblog"],
+    init_rc: ["hentak_scan.rc"],
+    system_ext_specific: true,
+}
+
+rust_test_host {
+    name: "hentak_rs_test",
+    crate_name: "hentak",
+    crate_root: "src/lib.rs",
+    srcs: [
+        "src/**/*.rs",
+        "data/*.bin",
+    ],
+    edition: "2021",
+    lints: "vendor",
+    clippy_lints: "vendor",
+    features: ["scan"],
+    test_suites: ["general-tests"],
+}

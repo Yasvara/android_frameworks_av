@@ -1,0 +1,54 @@
+// SPDX-FileCopyrightText: The Yasvara Project
+// SPDX-License-Identifier: Apache-2.0
+
+package {
+    default_applicable_licenses: ["frameworks_av_license"],
+}
+
+// Nada: CPU audio effects inside audioserver's mix threads (dsp/, C ABI in dsp/src/ffi.rs).
+rust_ffi_static {
+    name: "libnada_rs",
+    crate_name: "nada",
+    crate_root: "dsp/src/lib.rs",
+    srcs: ["dsp/src/**/*.rs"],
+    edition: "2021",
+    lints: "vendor",
+    clippy_lints: "vendor",
+    apex_available: ["//apex_available:platform"],
+}
+
+// One copy for libaudioflinger, its fast path and the AAudio service.
+cc_library_shared {
+    name: "libnada",
+    whole_static_libs: ["libnada_rs"],
+    export_include_dirs: ["include"],
+    shared_libs: ["liblog"],
+    header_libs: ["libaudio_system_headers"],
+    export_header_lib_headers: ["libaudio_system_headers"],
+}
+
+rust_test_host {
+    name: "nada_rs_test",
+    crate_name: "nada",
+    crate_root: "dsp/src/lib.rs",
+    srcs: ["dsp/src/**/*.rs"],
+    edition: "2021",
+    lints: "vendor",
+    clippy_lints: "vendor",
+    test_suites: ["general-tests"],
+}
+
+cc_binary {
+    name: "nadactl",
+    srcs: ["tools/nadactl.cpp"],
+    shared_libs: [
+        "libaudiobase",
+        "libaudioclient",
+        "libbinder",
+        "libutils",
+    ],
+    cflags: [
+        "-Wall",
+        "-Werror",
+    ],
+}

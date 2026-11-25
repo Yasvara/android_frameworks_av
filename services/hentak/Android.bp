@@ -1,0 +1,32 @@
+// SPDX-FileCopyrightText: The Yasvara Project
+// SPDX-License-Identifier: Apache-2.0
+
+package {
+    default_applicable_licenses: ["frameworks_av_license"],
+}
+
+// Hentak game haptics inside audioserver (AudioFlinger tracks): the per-track hand-over to the
+// Rust detectors (rust/), and the sender to the vibrator HAL (or system_server).
+cc_library_static {
+    name: "libhentak",
+    srcs: [
+        "Hentak.cpp",
+        "Tap.cpp",
+    ],
+    export_include_dirs: ["include"],
+    whole_static_libs: ["libhentak_rs"],
+    shared_libs: [
+        "android.hardware.vibrator-V4-ndk",
+        "vendor.yasvara.hentak-V1-ndk",
+        "libbinder",
+        "libbinder_ndk",
+        "liblog",
+        "libutils",
+    ],
+    header_libs: ["libaudio_system_headers"],
+    export_header_lib_headers: ["libaudio_system_headers"],
+    cflags: [
+        "-Wall",
+        "-Werror",
+    ],
+}
